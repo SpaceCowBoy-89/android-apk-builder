@@ -1,50 +1,195 @@
-name: Build APK from URL
+name: Plug-and-Play APK Builder
 
 on:
   workflow_dispatch:
     inputs:
       repo_url:
-        description: 'GitHub or GitLab repo URL of the Android project'
+        description: 'GitHub or GitLab repo URL (e.g., https://github.com/username/repo.git)'
         required: true
       branch:
-        description: 'Branch or tag to build (optional)'
+        description: 'Branch or tag to build (optional, defaults to default branch)'
         required: false
       module_name:
         description: 'Gradle module name (e.g., app) for APK output'
         required: false
         default: 'app'
+      project_path:
+        description: 'Path to Android project directory (optional, e.g., android/)'
+        required: false
+        default: ''
+      build_system:
+        description: 'Build system (gradle, ant, maven, auto) - defaults to auto'
+        required: false
+        default: 'auto'
 
 jobs:
-  build:
+  build-apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 30 # Prevent hanging jobs
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout code
+      - name: Check shell environment
         run: |
-          git clone "${{ github.event.inputs.repo_url }}" project
+          echo "Shell: $SHELL"
+          ps -p $$
+        shell: bash
+
+      - name: Clone repository
+        run: |
+          echo "Cloning repository: ${{ github.event.inputs.repo_url }}"
+          if [ -n "${{ secrets.GH_TOKEN }}" ]; then
+            git clone https://${{ secrets.GH_TOKEN }}:x-oauth-basic@${{ github.event.inputs.repo_url }} project
+          else
+            git clone "${{ github.event.inputs.repo_url }}" project
+          fi
           if [ $? -ne 0 ]; then
             echo "❌ Failed to clone repository"
             exit 1
           fi
           cd project
           if [ -n "${{ github.event.inputs.branch }}" ]; then
+            echo "Checking out branch: ${{ github.event.inputs.branch }}"
             git checkout "${{ github.event.inputs.branch }}"
             if [ $? -ne 0 ]; then
               echo "❌ Failed to checkout branch: ${{ github.event.inputs.branch }}"
               exit 1
             fi
           fi
+          echo "Repository contents:"
+          ls -la
         shell: bash
 
-      - name: Prepare project
+      - name: Detect project directory and build system
         run: |
-          if [ ! -f project/build.gradle ]; then
-            echo "❌ No build.gradle found in repository root"
+          if [ -n "${{ github.event.inputs.project_path }}" ]; then
+            PROJECT_DIR="project/${{ github.event.inputs.project_path }}"
+          else
+            PROJECT_DIR=$(find project -type f \( -name "build.gradle" -o -name "build.xml" -o -name "pom.xml" -o -name "AndroidManifest.xml" \) -exec dirname {} \; | head -n 1)
+            if [ -z "$PROJECT_DIR" ]; then
+              echo "❌ No build files or AndroidManifest.xml found in repository"
+              exit 1
+            fi
+            PROJECT_PATH=$(realpath --relative-to=project "$PROJECT_DIR")
+            echo "Detected project directory: $PROJECT_PATH"
+            echo "project_path=$PROJECT_PATH" >> $GITHUB_ENV
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+          # Detect build system if 'auto'
+          if [ "${{ github.event.inputs.build_system }}" = "auto" ]; then
+            if [ -f "$PROJECT_DIR/build.gradle" ]; then
+              echo "Detected Gradle project"
+              echo "BUILD_SYSTEM=gradle" >> $GITHUB_ENV
+            elif [ -f "$PROJECT_DIR/build.xml" ]; then
+              echo "Detected Ant project"
+              echo "BUILD_SYSTEM=ant" >> $GITHUB_ENV
+            elif [ -f "$PROJECT_DIR/pom.xml" ]; then
+              echo "Detected Maven project"
+              echo "BUILD_SYSTEM=maven" >> $GITHUB_ENV
+            elif [ -f "$PROJECT_DIR/AndroidManifest.xml" ]; then
+              echo "Detected Android project without build system; will scaffold Gradle"
+              echo "BUILD_SYSTEM=gradle-scaffold" >> $GITHUB_ENV
+            else
+              echo "❌ No supported build system or Android project found"
+              exit 1
+            fi
+          else
+            echo "BUILD_SYSTEM=${{ github.event.inputs.build_system }}" >> $GITHUB_ENV
+          fi
+        shell: bash
+
+      - name: Validate build system
+        run: |
+          if [ "$BUILD_SYSTEM" = "gradle" ] && [ ! -f "${{ env.PROJECT_DIR }}/build.gradle" ]; then
+            echo "❌ No build.gradle found in ${{ env.PROJECT_DIR }}"
+            exit 1
+          elif [ "$BUILD_SYSTEM" = "ant" ] && [ ! -f "${{ env.PROJECT_DIR }}/build.xml" ]; then
+            echo "❌ No build.xml found in ${{ env.PROJECT_DIR }}"
+            exit 1
+          elif [ "$BUILD_SYSTEM" = "maven" ] && [ ! -f "${{ env.PROJECT_DIR }}/pom.xml" ]; then
+            echo "❌ No pom.xml found in ${{ env.PROJECT_DIR }}"
+            exit 1
+          elif [ "$BUILD_SYSTEM" = "gradle-scaffold" ] && [ ! -f "${{ env.PROJECT_DIR }}/AndroidManifest.xml" ]; then
+            echo "❌ No AndroidManifest.xml found in ${{ env.PROJECT_DIR }} for scaffolding"
             exit 1
           fi
-          mv project/* .
-          rm -rf project
+          echo "Using build system: $BUILD_SYSTEM"
+          echo "Directory contents:"
+          ls -la "${{ env.PROJECT_DIR }}"
+        shell: bash
+
+      - name: Scaffold Gradle structure (if needed)
+        if: env.BUILD_SYSTEM == 'gradle-scaffold'
+        run: |
+          echo "Scaffolding Gradle structure in ${{ env.PROJECT_DIR }}"
+          mkdir -p "${{ env.PROJECT_DIR }}/${{ github.event.inputs.module_name }}"
+          mv "${{ env.PROJECT_DIR }}/AndroidManifest.xml" "${{ env.PROJECT_DIR }}/${{ github.event.inputs.module_name }}/" || true
+          mv "${{ env.PROJECT_DIR }}/src" "${{ env.PROJECT_DIR }}/${{ github.event.inputs.module_name }}/" || true
+          mv "${{ env.PROJECT_DIR }}/res" "${{ env.PROJECT_DIR }}/${{ github.event.inputs.module_name }}/" || true
+          mv "${{ env.PROJECT_DIR }}/libs" "${{ env.PROJECT_DIR }}/${{ github.event.inputs.module_name }}/" || true
+          
+          # Create settings.gradle
+          cat > "${{ env.PROJECT_DIR }}/settings.gradle" << 'EOF'
+          include ':${{ github.event.inputs.module_name }}'
+          EOF
+          
+          # Create build.gradle (root)
+          cat > "${{ env.PROJECT_DIR }}/build.gradle" << 'EOF'
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.5.0'
+              }
+          }
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          EOF
+          
+          # Create app/build.gradle
+          cat > "${{ env.PROJECT_DIR }}/${{ github.event.inputs.module_name }}/build.gradle" << 'EOF'
+          apply plugin: 'com.android.application'
+          android {
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.example.app"
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              buildTypes {
+                  debug {
+                      minifyEnabled false
+                  }
+              }
+          }
+          dependencies {
+              implementation 'androidx.core:core:1.12.0'
+          }
+          EOF
+          
+          # Download Gradle wrapper
+          mkdir -p "${{ env.PROJECT_DIR }}/gradle/wrapper"
+          curl -L https://github.com/gradle/gradle-build/releases/download/wrapper/gradle-8.5-bin.zip -o /tmp/gradle.zip
+          unzip /tmp/gradle.zip -d /tmp
+          mv /tmp/gradle-8.5 "${{ env.PROJECT_DIR }}/gradle/wrapper/gradle-8.5"
+          cat > "${{ env.PROJECT_DIR }}/gradle/wrapper/gradle-wrapper.properties" << 'EOF'
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.5-bin.zip
+          EOF
+          cat > "${{ env.PROJECT_DIR }}/gradlew" << 'EOF'
+          #!/bin/bash
+          GRADLE_HOME="$(dirname "$(realpath "$0")")/gradle/wrapper/gradle-8.5"
+          exec "$GRADLE_HOME/bin/gradle" "$@"
+          EOF
+          chmod +x "${{ env.PROJECT_DIR }}/gradlew"
+          echo "Gradle structure scaffolded"
         shell: bash
 
       - name: Set up JDK 17
@@ -53,7 +198,15 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Cache Gradle dependencies
+      - name: Set up Ant (if needed)
+        if: env.BUILD_SYSTEM == 'ant'
+        run: |
+          sudo apt-get update
+          sudo apt-get install ant
+        shell: bash
+
+      - name: Cache Gradle dependencies (if Gradle)
+        if: env.BUILD_SYSTEM == 'gradle' || env.BUILD_SYSTEM == 'gradle-scaffold'
         uses: actions/cache@v4
         with:
           path: |
@@ -63,22 +216,38 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Make Gradle Wrapper executable
-        run: chmod +x ./gradlew
-
-      - name: Build Debug APK
+      - name: Make Gradle Wrapper executable (if Gradle)
+        if: env.BUILD_SYSTEM == 'gradle' || env.BUILD_SYSTEM == 'gradle-scaffold'
         run: |
-          if [ ! -f gradlew ]; then
-            echo "❌ Gradle Wrapper (gradlew) not found"
+          if [ ! -f "${{ env.PROJECT_DIR }}/gradlew" ]; then
+            echo "❌ Gradle Wrapper (gradlew) not found in ${{ env.PROJECT_DIR }}"
             exit 1
           fi
-          ./gradlew assembleDebug --no-daemon
+          chmod +x "${{ env.PROJECT_DIR }}/gradlew"
         shell: bash
+
+      - name: Build with Gradle
+        if: env.BUILD_SYSTEM == 'gradle' || env.BUILD_SYSTEM == 'gradle-scaffold'
+        run: |
+          ./${{ env.project_path }}/gradlew assembleDebug --no-daemon
+        shell: bash
+        working-directory: project
+
+      - name: Build with Ant
+        if: env.BUILD_SYSTEM == 'ant'
+        run: ant debug
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+
+      - name: Build with Maven
+        if: env.BUILD_SYSTEM == 'maven'
+        run: mvn package
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: debug-apk
-          path: ${{ github.event.inputs.module_name }}/build/outputs/apk/**/*.apk
+          path: ${{ env.PROJECT_DIR }}/**/build/**/*.apk
           retention-days: 7
-
